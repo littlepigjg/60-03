@@ -1,4 +1,15 @@
 (async function () {
+  const urlParams = new URLSearchParams(location.search);
+  const debugMode = urlParams.get('debug');
+  if (debugMode === 'host') {
+    sessionStorage.setItem('mode', 'host');
+    sessionStorage.setItem('userName', '调试主持人');
+  } else if (debugMode === 'viewer') {
+    sessionStorage.setItem('mode', 'viewer');
+    sessionStorage.setItem('userName', '调试观众');
+    sessionStorage.setItem('roomCode', '000000');
+  }
+
   const mode = sessionStorage.getItem('mode');
   const savedName = sessionStorage.getItem('userName') || '';
   const savedRoomCode = sessionStorage.getItem('roomCode');
@@ -25,8 +36,31 @@
   const audioBtn = $('#audioBtn');
   const leaveBtn = $('#leaveBtn');
 
+  const recordBtn = $('#recordBtn');
+  const recordingControls = $('#recordingControls');
+  const pauseRecBtn = $('#pauseRecBtn');
+  const stopRecBtn = $('#stopRecBtn');
+  const recordingTimer = $('#recordingTimer');
+  const recordingIndicator = $('#recordingIndicator');
+  const previewModal = $('#previewModal');
+  const previewVideo = $('#previewVideo');
+  const previewDuration = $('#previewDuration');
+  const previewSize = $('#previewSize');
+  const closePreviewBtn = $('#closePreviewBtn');
+  const cancelDownloadBtn = $('#cancelDownloadBtn');
+  const downloadBtn = $('#downloadBtn');
+  const qualitySelect = $('#qualitySelect');
+
+  let screenRecorder = null;
+  let previewBlobUrl = null;
+  let lastRecordingResult = null;
+
   roleTag.textContent = mode === 'host' ? '主持人' : '观看者';
   roleTag.className = 'role-tag ' + (mode === 'host' ? 'host' : 'viewer');
+
+  if (mode !== 'host') {
+    recordBtn.style.display = 'none';
+  }
 
   const signaling = new SignalingClient();
   let webrtc = null;
@@ -68,6 +102,12 @@
   };
   webrtc.emitStreamEnded = () => {
     if (mode === 'host') {
+      if (screenRecorder && screenRecorder.isRecording) {
+        screenRecorder.stop().then(() => {
+          UI.toast('屏幕共享已停止，录制已保存');
+          showPreview(lastRecordingResult);
+        }).catch(() => {});
+      }
       UI.toast('屏幕共享已停止，正在重新请求...');
       location.reload();
     }
@@ -87,11 +127,202 @@
   });
 
   leaveBtn.addEventListener('click', () => {
-    if (confirm('确定要离开房间吗？')) {
-      cleanup();
-      location.href = '/';
+    if (screenRecorder && screenRecorder.isRecording) {
+      if (!confirm('正在录制中，确定要离开吗？录制将自动停止并保存。')) {
+        return;
+      }
+      screenRecorder.stop().then(() => {
+        showPreview(lastRecordingResult);
+        doLeave();
+      }).catch(() => doLeave());
+    } else {
+      if (confirm('确定要离开房间吗？')) {
+        doLeave();
+      }
     }
   });
+
+  function doLeave() {
+    cleanup();
+    location.href = '/';
+  }
+
+  if (mode === 'host') {
+    recordBtn.addEventListener('click', startRecording);
+  }
+  pauseRecBtn.addEventListener('click', togglePauseRecording);
+  stopRecBtn.addEventListener('click', stopRecording);
+
+  closePreviewBtn.addEventListener('click', hidePreview);
+  cancelDownloadBtn.addEventListener('click', hidePreview);
+  previewModal.addEventListener('click', (e) => {
+    if (e.target === previewModal) hidePreview();
+  });
+  downloadBtn.addEventListener('click', handleDownload);
+
+  function startRecording() {
+    if (!webrtc.localStream) {
+      UI.toast('屏幕共享未就绪，无法录制');
+      return;
+    }
+    if (typeof MediaRecorder === 'undefined') {
+      UI.toast('当前浏览器不支持录制功能');
+      return;
+    }
+
+    try {
+      const combinedStream = new MediaStream();
+      webrtc.localStream.getVideoTracks().forEach(t => combinedStream.addTrack(t));
+      if (webrtc.localAudioStream) {
+        webrtc.localAudioStream.getAudioTracks().forEach(t => combinedStream.addTrack(t));
+      }
+
+      screenRecorder = new ScreenRecorder(combinedStream);
+      screenRecorder.onStateChange = (state) => {
+        if (state === 'error') {
+          UI.toast('录制出错');
+          resetRecordingUI();
+        }
+      };
+
+      screenRecorder.start('webm', 'medium');
+      lastRecordingResult = null;
+
+      recordBtn.style.display = 'none';
+      recordingControls.style.display = 'flex';
+      recordBtn.classList.add('recording-active');
+      recordingIndicator.classList.remove('paused');
+      pauseRecBtn.querySelector('span').textContent = '暂停';
+      UI.toast('开始录制');
+    } catch (e) {
+      console.error('startRecording failed:', e);
+      UI.toast('启动录制失败: ' + (e.message || e));
+    }
+  }
+
+  function togglePauseRecording() {
+    if (!screenRecorder) return;
+    if (screenRecorder.isPaused) {
+      screenRecorder.resume();
+      recordingIndicator.classList.remove('paused');
+      pauseRecBtn.querySelector('span').textContent = '暂停';
+      pauseRecBtn.querySelector('svg').innerHTML =
+        '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';
+      UI.toast('继续录制');
+    } else {
+      screenRecorder.pause();
+      recordingIndicator.classList.add('paused');
+      pauseRecBtn.querySelector('span').textContent = '继续';
+      pauseRecBtn.querySelector('svg').innerHTML =
+        '<polygon points="5 3 19 12 5 21 5 3"/>';
+      UI.toast('已暂停录制');
+    }
+  }
+
+  async function stopRecording() {
+    if (!screenRecorder) return;
+    try {
+      const result = await screenRecorder.stop();
+      lastRecordingResult = result;
+      resetRecordingUI();
+      UI.toast('录制已完成');
+      showPreview(result);
+    } catch (e) {
+      console.error('stopRecording failed:', e);
+      UI.toast('停止录制失败: ' + (e.message || e));
+      resetRecordingUI();
+    }
+  }
+
+  function resetRecordingUI() {
+    recordingControls.style.display = 'none';
+    recordBtn.style.display = '';
+    recordBtn.classList.remove('recording-active');
+    recordingTimer.textContent = '00:00:00';
+    recordingIndicator.classList.remove('paused');
+    pauseRecBtn.querySelector('span').textContent = '暂停';
+    pauseRecBtn.querySelector('svg').innerHTML =
+      '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';
+  }
+
+  function showPreview(result) {
+    if (!result || !result.blob) return;
+
+    if (previewBlobUrl) URL.revokeObjectURL(previewBlobUrl);
+    previewBlobUrl = screenRecorder.getPreviewUrl();
+    previewVideo.src = previewBlobUrl;
+    previewDuration.textContent = ScreenRecorder.formatTime(result.duration);
+    previewSize.textContent = ScreenRecorder.formatSize(result.blob.size);
+
+    const mp4Radio = document.querySelector('input[name="format"][value="mp4"]');
+    const webmRadio = document.querySelector('input[name="format"][value="webm"]');
+    const hasAudio = webrtc.localAudioStream && webrtc.localAudioStream.getAudioTracks().length > 0;
+    const supportsMp4 = ScreenRecorder.getSupportedMimeTypes().some(t => t.includes('mp4'));
+
+    if (!supportsMp4) {
+      mp4Radio.disabled = true;
+      mp4Radio.checked = false;
+      webmRadio.checked = true;
+      const mp4Label = mp4Radio.closest('.radio-option');
+      mp4Label.style.opacity = '0.5';
+      mp4Label.title = '当前浏览器不支持MP4编码';
+    }
+
+    if (!hasAudio && supportsMp4) {
+      mp4Radio.disabled = true;
+      mp4Radio.checked = false;
+      webmRadio.checked = true;
+      const mp4Label = mp4Radio.closest('.radio-option');
+      mp4Label.style.opacity = '0.5';
+      mp4Label.title = '无音频轨时浏览器通常无法生成MP4';
+    }
+
+    previewModal.style.display = 'flex';
+    setTimeout(() => { previewVideo.play().catch(() => {}); }, 100);
+  }
+
+  function hidePreview() {
+    previewModal.style.display = 'none';
+    previewVideo.pause();
+    previewVideo.src = '';
+    if (previewBlobUrl) {
+      URL.revokeObjectURL(previewBlobUrl);
+      previewBlobUrl = null;
+    }
+  }
+
+  async function handleDownload() {
+    if (!screenRecorder || !lastRecordingResult) return;
+
+    const formatRadio = document.querySelector('input[name="format"]:checked');
+    const format = formatRadio ? formatRadio.value : 'webm';
+    const quality = qualitySelect.value;
+
+    downloadBtn.disabled = true;
+    const originalText = downloadBtn.textContent;
+    downloadBtn.textContent = '处理中...';
+
+    try {
+      const result = await screenRecorder.convertBlob(format, quality);
+      const ext = ScreenRecorder._getExtension(result.mimeType, format);
+      const filename = ScreenRecorder.generateFileName(ext);
+      ScreenRecorder.downloadBlob(result.blob, filename);
+
+      if (result.note) {
+        UI.toast(result.note);
+      } else {
+        UI.toast('已开始下载: ' + filename);
+      }
+
+      hidePreview();
+    } catch (e) {
+      console.error('handleDownload failed:', e);
+      UI.toast('下载失败: ' + (e.message || e));
+    } finally {
+      downloadBtn.disabled = false;
+      downloadBtn.textContent = originalText;
+    }
+  }
 
   signaling.on('room-created', (msg) => {
     signaling.roomCode = msg.roomCode;
@@ -220,6 +451,10 @@
   function cleanup() {
     try { signaling.leaveRoom(); } catch (e) { /* ignore */ }
     try { webrtc.destroy(); } catch (e) { /* ignore */ }
+    try { screenRecorder && screenRecorder.destroy(); } catch (e) { /* ignore */ }
+    if (previewBlobUrl) {
+      URL.revokeObjectURL(previewBlobUrl);
+    }
   }
   window.addEventListener('beforeunload', cleanup);
 
